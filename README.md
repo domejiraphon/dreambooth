@@ -23,6 +23,7 @@ Overview of the code:
 3. Create dataset
 4. Train
 
+### 2.1. Training Arguments:
 To train the model, follow these steps:
 
 Note that during the training process, we do not generate images on the fly due to the long training times, unlike the paper. Instead, we generate regularization images in advance, typically around 200-300 images. Once this is done, you can proceed with training. The code dose this step automatically. We also provide the example dataset in `./dataset`
@@ -36,6 +37,7 @@ The arguments for training:
    - `--class_prompt`: Specify the class prompt used during training.
    - `--output_dir`: Specify the folder to store our checkpoints/log. 
 
+### 2.2. Run train code:
 ```
 bash scripts/train.sh
 ```
