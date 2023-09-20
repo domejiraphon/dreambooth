@@ -39,6 +39,12 @@ The arguments for training:
 ```
 bash scripts/train.sh
 ```
+Run the following command to see the training log in tensorboard, Then go to: http://localhost:6006/
+```
+tensorboard --logdir=./runs --reload_multifile=True --port=6006 --host=localhost
+``` 
+
+
 You can view all available configuration options for training the model by running the following command or see the code:
 
 ```
