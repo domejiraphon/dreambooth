@@ -16,6 +16,12 @@ To install the required libraries, run the following command:
 pip install -r requirements.txt
 ```
 ## 2. Training instructions
+Overview of the code:
+
+1. Generate regularization images
+2. Load pretrained model, tokenizer, CLIP text encoder
+3. Create dataset
+4. Train
 
 To train the model, follow these steps:
 
@@ -35,9 +41,10 @@ bash scripts/train.sh
 ```
 You can view all available configuration options for training the model by running the following command or see the code:
 
-```bash
+```
 python train_dreambooth.py --help
 ```
+
 ## 3. Inference
 
 Once you have completed the training process, you can perform inference to generate images using the trained model. 
