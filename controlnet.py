@@ -41,6 +41,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+from torchvision.transforms import ToPILImage
 
 import diffusers
 from diffusers import (
@@ -49,6 +50,8 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
+    StableDiffusionXLControlNetPipeline, 
+    ControlNetModel,
 )
 from diffusers.loaders import LoraLoaderMixin, text_encoder_lora_state_dict
 from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
@@ -56,7 +59,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from loguru import logger as lg 
-
+from transformers import DPTFeatureExtractor, DPTForDepthEstimation
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
 
@@ -127,6 +130,20 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_controlnet",
+        type=str,
+        default="diffusers/controlnet-depth-sdxl-1.0",
+        help="Path to pretrained controlnet identifier from huggingface.co/models.",
+    )
+    parser.add_argument('--guess_mode', 
+        action='store_true',
+        help="Guess mode for ControlNet"
+    )
+    parser.add_argument('--conditioning_scale', 
+        type=float, 
+        default=0.5
     )
     parser.add_argument(
         "--pretrained_vae_model_name_or_path",
@@ -475,9 +492,47 @@ class DreamBoothDataset(Dataset):
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.ToTensor(),
+                #transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        self.normalize = transforms.Compose(
+            [
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
+        self._set_up_depth_estimation()
+        self.to_pil = ToPILImage()
+    def _set_up_depth_estimation(self):
+        self.depth_estimator = DPTForDepthEstimation.from_pretrained(
+            "Intel/dpt-hybrid-midas"
+        ).to("cuda")
+        self.feature_extractor = DPTFeatureExtractor.from_pretrained(
+            "Intel/dpt-hybrid-midas"
+        )
+
+    def _get_depth_map(
+        self, 
+        image
+    ):  
+     
+        image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
+        with torch.no_grad(), torch.autocast("cuda"):
+            depth_map = self.depth_estimator(image).predicted_depth
+       
+        depth_map = torch.nn.functional.interpolate(
+            depth_map.unsqueeze(1),
+            size=(1024, 1024),
+            mode="bicubic",
+            align_corners=False,
+        )
+        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+        image = torch.cat([depth_map] * 3, dim=1)[0]
+
+        # image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
+        # image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
+        return image
 
     def __len__(self):
         return self._length
@@ -490,6 +545,8 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_depth_images"] = self._get_depth_map(self.to_pil(example['instance_images']))
+        example["instance_images"] = self.normalize(example["instance_images"])
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
@@ -498,22 +555,28 @@ class DreamBoothDataset(Dataset):
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
+            example["class_depth_images"] = self._get_depth_map(self.to_pil(example['class_images']))
+            example["class_images"] = self.normalize(example["class_images"])
 
         return example
 
 
 def collate_fn(examples, with_prior_preservation=False):
     pixel_values = [example["instance_images"] for example in examples]
-
+    depth_values = [example["instance_depth_images"] for example in examples]
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
     if with_prior_preservation:
         pixel_values += [example["class_images"] for example in examples]
+        depth_values +=[example["class_depth_images"] for example in examples]
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values}
+    depth_values = torch.stack(depth_values)
+    depth_values = depth_values.to(memory_format=torch.contiguous_format).float()
+    batch = {"pixel_values": pixel_values,
+            "depth_values": depth_values}
     return batch
 
 
@@ -718,12 +781,15 @@ def main(args):
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
-
+    controlnet = ControlNetModel.from_pretrained(
+        args.pretrained_controlnet, 
+    )
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
+    controlnet.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -741,6 +807,7 @@ def main(args):
 
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    controlnet.to(accelerator.device, dtype=weight_dtype)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -820,7 +887,7 @@ def main(args):
                 # make sure to pop weight so that corresponding model is not saved again
                 weights.pop()
 
-            StableDiffusionXLPipeline.save_lora_weights(
+            StableDiffusionXLControlNetPipeline.save_lora_weights(
                 output_dir,
                 unet_lora_layers=unet_lora_layers_to_save,
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
@@ -1000,12 +1067,12 @@ def main(args):
 
     # Prepare everything with our `accelerator`.
     if args.train_text_encoder:
-        unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+        unet, controlnet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, controlnet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
         )
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        unet, controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, controlnet, optimizer, train_dataloader, lr_scheduler
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -1070,6 +1137,7 @@ def main(args):
             text_encoder_two.train()
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
+           
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
@@ -1100,6 +1168,7 @@ def main(args):
                 # Calculate the elements to repeat depending on the use of prior-preservation.
                 elems_to_repeat = bsz // 2 if args.with_prior_preservation else bsz
 
+                
                 # Predict the noise residual
                 if not args.train_text_encoder:
                     unet_added_conditions = {
@@ -1107,13 +1176,34 @@ def main(args):
                         "text_embeds": unet_add_text_embeds.repeat(elems_to_repeat, 1),
                     }
                     prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat, 1, 1)
+
+                    control_model_input = noisy_model_input
+                    controlnet_prompt_embeds = prompt_embeds
+                    controlnet_added_cond_kwargs =  unet_added_conditions
+
+                    cond_scale = np.random.rand()
+                    down_block_res_samples, mid_block_res_sample = controlnet(
+                        control_model_input,
+                        timesteps,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=batch['depth_values'],
+                        conditioning_scale=cond_scale,
+                        guess_mode=args.guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+                   
                     model_pred = unet(
                         noisy_model_input,
                         timesteps,
-                        prompt_embeds_input,
+                        encoder_hidden_states=prompt_embeds_input,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
                         added_cond_kwargs=unet_added_conditions,
                     ).sample
+                    
                 else:
+                    raise "Not supported"
                     unet_added_conditions = {"time_ids": add_time_ids.repeat(elems_to_repeat, 1)}
                     prompt_embeds, pooled_prompt_embeds = encode_prompt(
                         text_encoders=[text_encoder_one, text_encoder_two],
@@ -1201,75 +1291,6 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                # create pipeline
-                if not args.train_text_encoder:
-                    text_encoder_one = text_encoder_cls_one.from_pretrained(
-                        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-                    )
-                    text_encoder_two = text_encoder_cls_two.from_pretrained(
-                        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
-                    )
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    unet=accelerator.unwrap_model(unet),
-                    revision=args.revision,
-                    torch_dtype=weight_dtype,
-                )
-
-                # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
-                scheduler_args = {}
-
-                if "variance_type" in pipeline.scheduler.config:
-                    variance_type = pipeline.scheduler.config.variance_type
-
-                    if variance_type in ["learned", "learned_range"]:
-                        variance_type = "fixed_small"
-
-                    scheduler_args["variance_type"] = variance_type
-
-                pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
-                    pipeline.scheduler.config, **scheduler_args
-                )
-
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-                pipeline_args = {"prompt": args.validation_prompt}
-
-                with torch.cuda.amp.autocast():
-                    images = [
-                        pipeline(**pipeline_args, generator=generator).images[0]
-                        for _ in range(args.num_validation_images)
-                    ]
-
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
-
-                del pipeline
-                torch.cuda.empty_cache()
-
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1286,13 +1307,13 @@ def main(args):
             text_encoder_lora_layers = None
             text_encoder_2_lora_layers = None
 
-        StableDiffusionXLPipeline.save_lora_weights(
+        StableDiffusionXLControlNetPipeline.save_lora_weights(
             save_directory=args.output_dir,
             unet_lora_layers=unet_lora_layers,
             text_encoder_lora_layers=text_encoder_lora_layers,
             text_encoder_2_lora_layers=text_encoder_2_lora_layers,
         )
-
+        raise "Not supported inference"
         # Final inference
         # Load previous pipeline
         vae = AutoencoderKL.from_pretrained(
@@ -1301,8 +1322,17 @@ def main(args):
             revision=args.revision,
             torch_dtype=weight_dtype,
         )
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.pretrained_model_name_or_path, vae=vae, revision=args.revision, torch_dtype=weight_dtype
+        controlnet = ControlNetModel.from_pretrained(
+            args.pretrained_controlnet,
+            variant="fp16",
+            use_safetensors=True,
+            torch_dtype=weight_dtype,
+        )
+        pipeline = StableDiffusionXLControlNetPipeline.from_pretrained(
+            args.pretrained_model_name_or_path, 
+            vae=vae, 
+            revision=args.revision, 
+            torch_dtype=weight_dtype
         )
 
         # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
